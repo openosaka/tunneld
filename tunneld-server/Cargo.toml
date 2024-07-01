@@ -20,7 +20,11 @@ tokio-stream = "0.1.15"
 tokio-util = "0.7.11"
 futures = "0.3.30"
 uuid = { version = "1.9.1", features = ["v4", "serde"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1.5", features = ["full"] }
 dashmap = "6.0.1"
+bytes = "1.6.0"
+http-body-util = { version = "0.1.2" }
 
 [[bin]]
 name = "tunneld"

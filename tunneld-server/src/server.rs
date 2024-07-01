@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::{net::ToSocketAddrs, pin::Pin};
 
-use crate::{manager, Config};
+use crate::transport::{EventBus, HttpManager};
+use crate::Config;
 use anyhow::Context as _;
 use core::task::{Context, Poll};
 use dashmap::DashMap;
@@ -11,7 +12,7 @@ use tokio::sync::oneshot;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server as GrpcServer, Request, Response, Status, Streaming};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use tunneld_pkg::event;
 use tunneld_protocol::pb::{
     control::Payload,
@@ -81,8 +82,10 @@ impl<T> Drop for CancelableReceiver<T> {
 }
 
 pub struct Server {
-    config: Config,
-    server: GrpcServer,
+    control_port: u16,
+    vhttp_port: u16,
+    control_server: GrpcServer,
+    events: EventBus,
 }
 
 impl Server {
@@ -91,12 +94,18 @@ impl Server {
         let server = GrpcServer::builder()
             .http2_keepalive_interval(Some(tokio::time::Duration::from_secs(60)))
             .http2_keepalive_timeout(Some(tokio::time::Duration::from_secs(3)));
+        let events = EventBus::new(config.vhttp_port, config.domain.clone());
 
-        Self { config, server }
+        Self {
+            control_port: config.control_port,
+            vhttp_port: config.vhttp_port,
+            control_server: server,
+            events,
+        }
     }
 
-    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        let addr = format!("0.0.0.0:{}", self.config.control_port)
+    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let addr = format!("0.0.0.0:{}", self.control_port)
             .to_socket_addrs()
             .context("parse control port")?
             .next()
@@ -106,16 +115,22 @@ impl Server {
         let (event_tx, event_rx) = mpsc::channel(1024);
 
         let handler = Handler::new(cancel.clone(), event_tx);
+        let events = self.events;
         tokio::spawn(async move {
-            manager::TcpManager::new().handle_listeners(event_rx).await;
+            events.listen(event_rx).await;
         });
 
-        debug!("starting server on: {}", addr);
+        info!("starting control server on: {}", addr);
 
-        self.server
-            .add_service(TunnelServiceServer::new(handler))
-            .serve_with_shutdown(addr, cancel.cancelled())
-            .await?;
+        let mut control_server = self.control_server;
+        let run_control_server = tokio::spawn(async move {
+            control_server
+                .add_service(TunnelServiceServer::new(handler))
+                .serve_with_shutdown(addr, cancel.cancelled())
+                .await
+        });
+
+        let _grpc_result = tokio::join!(run_control_server);
         Ok(())
     }
 }
@@ -163,7 +178,7 @@ impl TunnelService for Handler {
                 mpsc::channel::<event::ConnEvent>(1024);
             event_tx
                 .send(event::Event {
-                    payload: event::Payload::TcpRegister {
+                    payload: event::Payload::RegisterTcp {
                         port: remote_port as u16,
                         cancel: cancel_listener,
                         conn_event_chan: conn_event_chan_tx,
@@ -350,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_server() {
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             control_port: 8610,
             http_port: 8611,
             domain: "".to_string(),

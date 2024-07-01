@@ -1,10 +1,19 @@
 use std::sync::Arc;
 
+use http_body_util::Full;
+use bytes::Bytes;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use anyhow::Context as _;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use tokio::io::AsyncWriteExt; // for shutdown() method
 use tokio::{io, select, spawn, sync::mpsc};
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
 use tracing::debug;
+use std::convert::Infallible;
+use hyper::{Request, Response};
 use tunneld_pkg::{
     event,
     io::{StreamingReader, StreamingWriter, VecWrapper},
@@ -12,19 +21,25 @@ use tunneld_pkg::{
 };
 use uuid::Uuid;
 
-pub struct TcpManager {}
+pub struct EventBus {
+    vhttp_port: u16,
+    domain: String,
+}
 
-impl TcpManager {
-    pub fn new() -> Self {
-        Self {}
+impl EventBus {
+    pub fn new(vhttp_port: u16, domain: String) -> Self {
+        Self {
+            vhttp_port,
+            domain,
+        }
     }
 
-    pub async fn handle_listeners(self, mut receiver: mpsc::Receiver<event::Event>) {
+    pub async fn listen(self, mut receiver: mpsc::Receiver<event::Event>) {
         let this = Arc::new(self);
 
         while let Some(event) = receiver.recv().await {
             match event.payload {
-                event::Payload::TcpRegister {
+                event::Payload::RegisterTcp {
                     port,
                     cancel,
                     conn_event_chan,
@@ -42,6 +57,19 @@ impl TcpManager {
                         event.resp.send(Some(status)).unwrap();
                     }
                 },
+                event::Payload::RegisterHttp {
+                    port,
+                    subdomain,
+                    domain,
+                } => {
+                    if port.is_none()
+                        && subdomain.is_none()
+                        && domain.is_none()
+                    {
+                        event.resp.send(Some(Status::invalid_argument("invalid http tunnel arguments"))).unwrap();
+                        continue;
+                    }
+                }
             }
         }
 
@@ -130,4 +158,43 @@ impl TcpManager {
             }
         }
     }
+}
+
+pub struct HttpManager {
+    pub port: u16,
+    pub domain: String,
+}
+
+impl HttpManager {
+    pub fn new(port: u16, domain: String) -> Self {
+        Self { port, domain }
+    }
+
+    pub async fn run(self) {
+        let listener = create_listener(self.port).await.unwrap();
+        let this = Arc::new(self);
+
+        while let Ok((stream, _addr)) = listener.accept().await {
+            let this = Arc::clone(&this);
+            tokio::spawn(async move {
+                this.handle_connection(stream).await;
+            });
+        }
+    }
+
+    async fn handle_connection(&self, stream: tokio::net::TcpStream) {
+        let io = TokioIo::new(stream);
+        let _handler = tokio::task::spawn(async move {
+            Builder::new(TokioExecutor::new())
+                .http1()
+                .serve_connection(io, service_fn(http_tunnel))
+                .await
+        });
+    }
+}
+
+async fn http_tunnel(
+    _req: Request<impl hyper::body::Body>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::new(Full::new(Bytes::from("Hello World!"))))
 }
